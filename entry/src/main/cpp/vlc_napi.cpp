@@ -29,16 +29,15 @@ void OnLibvlcLog(void *data, int level, const libvlc_log_t *ctx, const char *fmt
 {
     (void)data;
     (void)ctx;
+    if (level < LIBVLC_WARNING) {
+        return;
+    }
     char msg[2048] = {0};
     vsnprintf(msg, sizeof(msg), fmt, args);
     if (level >= LIBVLC_ERROR) {
         OH_LOG_ERROR(LOG_APP, "libvlc: %{public}s", msg);
-    } else if (level == LIBVLC_WARNING) {
-        OH_LOG_WARN(LOG_APP, "libvlc: %{public}s", msg);
-    } else if (level == LIBVLC_DEBUG) {
-        OH_LOG_DEBUG(LOG_APP, "libvlc: %{public}s", msg);
     } else {
-        OH_LOG_INFO(LOG_APP, "libvlc: %{public}s", msg);
+        OH_LOG_WARN(LOG_APP, "libvlc: %{public}s", msg);
     }
 }
 
@@ -447,7 +446,7 @@ napi_value LibvlcCreate(napi_env env, napi_callback_info info)
     std::vector<std::string> optStorage;
     std::vector<const char *> argvVlc;
     argvVlc.push_back(pp.c_str());
-    argvVlc.push_back("--verbose=2");
+    argvVlc.push_back("--verbose=0");
     argvVlc.push_back("--no-media-library");
     argvVlc.push_back("--ignore-config");
     argvVlc.push_back("--stats");

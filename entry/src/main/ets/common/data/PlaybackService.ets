@@ -568,6 +568,14 @@ export class PlaybackService {
     }
     this.sessionSyncTimer = setInterval(() => {
       void MediaSessionManager.updatePlaybackState(this.state, this.position, this.duration, this.speed);
+      const player = this.player;
+      const stats = player !== null ? player.getMedia()?.getStats() : null;
+      if (stats !== null && stats !== undefined) {
+        hilog.info(LOG_DOMAIN, LOG_TAG,
+          '[VLC] playback stats decoded=%{public}d displayed=%{public}d lost=%{public}d inputBitrate=%{public}s lostAudio=%{public}d',
+          stats.decodedVideo, stats.displayedPictures, stats.lostPictures,
+          String(stats.inputBitrate), stats.lostAbuffers);
+      }
     }, 1000);
   }
 
