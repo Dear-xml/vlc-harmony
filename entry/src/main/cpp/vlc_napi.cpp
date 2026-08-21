@@ -450,6 +450,10 @@ napi_value LibvlcCreate(napi_env env, napi_callback_info info)
     argvVlc.push_back("--no-media-library");
     argvVlc.push_back("--ignore-config");
     argvVlc.push_back("--stats");
+    /* Local 4K HEVC: default file-caching plus preroll lags the system gallery. */
+    argvVlc.push_back("--file-caching=100");
+    argvVlc.push_back("--no-drop-late-frames");
+    argvVlc.push_back("--no-avcodec-hurry-up");
 
     if (argc >= 1) {
         bool isArray = false;

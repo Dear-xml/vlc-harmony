@@ -57,6 +57,8 @@ package-lock.json
 
 temp
 docs/
+!ohos_vlc/docs/
+!ohos_vlc/docs/**
 
 .hvigor
 .idea

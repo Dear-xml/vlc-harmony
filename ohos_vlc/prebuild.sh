@@ -13,14 +13,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# 执行该脚本时需进入到脚本所在目录
-ROOT_DIR=$(pwd)
-API_VERSION=18 # 三方库对应API版本，用于记录SDK路径,必须和"compileSdkVersion"字段表示的API版本保持一致
-SDK_DIR=$OHOS_SDK_HOME/$API_VERSION # SDK路径（流水线环境中SDK路径）
+# 可在任意目录执行。优先 OHOS_SDK（含 native）或 OHOS_SDK_HOME/API_VERSION。
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+ROOT_DIR=$SCRIPT_DIR
+cd "$ROOT_DIR" || exit 1
+
+API_VERSION=${API_VERSION:-18}
+if [ -d "${OHOS_SDK:-}/native" ]; then
+    SDK_DIR=$OHOS_SDK
+else
+    SDK_DIR=${OHOS_SDK_HOME:-$HOME/Library/Huawei/Sdk/openharmony}/$API_VERSION
+    if [ ! -d "$SDK_DIR/native" ] && [ -d "$HOME/Library/Huawei/Sdk/openharmony/22/native" ]; then
+        SDK_DIR=$HOME/Library/Huawei/Sdk/openharmony/22
+    fi
+fi
 LYCIUM_TOOLS_URL=https://gitcode.com/openharmony-sig/tpc_c_cplusplus.git
 LYCIUM_ROOT_DIR=$ROOT_DIR/tpc_c_cplusplus
+# vlc-harmony 可复用工作区已有 tpc 检出，避免再 clone 一份。
+WORKSPACE_TPC=$(cd "$ROOT_DIR/../.." && pwd)/openharmony_tpc_samples/ohos_vlc/tpc_c_cplusplus
+if [ ! -d "$LYCIUM_ROOT_DIR" ] && [ -d "$WORKSPACE_TPC" ]; then
+    LYCIUM_ROOT_DIR=$WORKSPACE_TPC
+    echo "Reuse workspace tpc: $LYCIUM_ROOT_DIR"
+fi
 LYCIUM_TOOLS_DIR=$LYCIUM_ROOT_DIR/lycium
 LYCIUM_THIRDPARTY_DIR=$LYCIUM_ROOT_DIR/thirdparty
+FORCE_CLONE=${FORCE_CLONE:-0}
+OS_NAME=$(uname -s)
 
 function prepare_lycium_tools()
 {
@@ -30,6 +48,12 @@ function prepare_lycium_tools()
     "g++-multilib" "libltdl7-dev" "cabextract" "libboost-all-dev" "libxml2-utils" "gettext" "libxml-libxml-perl" \
     "libxml2" "libxml2-dev" "libxml-parser-perl" "texinfo" "libtool-bin" "xmlto" "po4a" "yasm" "nasm" "xutils-dev" \
     "libx11-dev" "xtrans-dev" "gfortran-arm-linux-gnueabi" "gfortran-aarch64-linux-gnu")
+
+    if [ "$OS_NAME" != "Linux" ] || ! command -v apt >/dev/null 2>&1
+    then
+        echo "Skip apt package install on $OS_NAME"
+        return 0
+    fi
 
     apt update >> /dev/null
 
@@ -46,33 +70,46 @@ function prepare_lycium_tools()
 
 function prepare_lycium()
 {
-    if [ -d $LYCIUM_ROOT_DIR ]
+    if [ -d "$LYCIUM_ROOT_DIR/.git" ] && [ "$FORCE_CLONE" != "1" ]
     then
-        rm -rf $LYCIUM_ROOT_DIR
+        echo "Reuse existing $LYCIUM_ROOT_DIR (set FORCE_CLONE=1 to re-clone)"
+    elif [ -d "$LYCIUM_ROOT_DIR" ] && [ "$FORCE_CLONE" != "1" ]
+    then
+        echo "Reuse existing $LYCIUM_ROOT_DIR"
+    else
+        if [ -d "$LYCIUM_ROOT_DIR" ]
+        then
+            rm -rf "$LYCIUM_ROOT_DIR"
+        fi
+        git clone $LYCIUM_TOOLS_URL --depth=1 "$LYCIUM_ROOT_DIR"
+        if [ $? -ne 0 ]
+        then
+            return 1
+        fi
     fi
 
-    git clone $LYCIUM_TOOLS_URL --depth=1
-    if [ $? -ne 0 ]
+    if [ ! -d "$LYCIUM_TOOLS_DIR/Buildtools" ]
     then
+        echo "ERROR: $LYCIUM_TOOLS_DIR/Buildtools not found"
         return 1
     fi
 
-    cd $LYCIUM_TOOLS_DIR/Buildtools
-    tar -zxvf toolchain.tar.gz
-    if [ $? -ne 0 ]
+    if [ ! -x "$SDK_DIR/native/llvm/bin/aarch64-linux-ohos-clang" ] && \
+       [ ! -x "$SDK_DIR/native/llvm/bin/aarch64-unknown-linux-ohos-clang" ]
     then
-        echo "unpack sdk toolchain failed!!"
-        cd $OLDPWD
-        return 1
+        (
+            cd "$LYCIUM_TOOLS_DIR/Buildtools" || exit 1
+            tar -zxvf toolchain.tar.gz
+            mkdir -p "$SDK_DIR/native/llvm/bin"
+            cp -f toolchain/* "$SDK_DIR/native/llvm/bin/" || echo "WARNING: cannot copy clang wrappers into SDK; using SDK clang names"
+            rm -rf toolchain
+        ) || return 1
+    else
+        echo "SDK clang already present, skip toolchain unpack"
     fi
-
-    cp toolchain/* $SDK_DIR/native/llvm/bin/
 
     prepare_lycium_tools
-    ret=$?
-    cd $OLDPWD
-
-    return $ret
+    return $?
 }
 
 function copy_depends()
@@ -89,12 +126,16 @@ function copy_depends()
 
 function check_sdk()
 {
-    if [ ! -d $SDK_DIR ]
+    if [ ! -d "$SDK_DIR/native" ]
     then
+        echo "ERROR: SDK native not found: $SDK_DIR"
+        echo "Set OHOS_SDK to the API dir that contains native/, e.g."
+        echo "  export OHOS_SDK=\$HOME/Library/Huawei/Sdk/openharmony/22"
         return 1
     fi
 
     export OHOS_SDK=$SDK_DIR
+    echo "OHOS_SDK=$OHOS_SDK"
     return 0
 }
 
@@ -122,15 +163,34 @@ function install_shasum()
 function start_build()
 {
     local result=0
-    cd $LYCIUM_TOOLS_DIR
-    if [ $? -ne 0 ]
+    cd "$LYCIUM_TOOLS_DIR" || return 1
+
+    export PATH="$LYCIUM_TOOLS_DIR/wrapper-bin:$PATH"
+    export LYCIUM_ARCHS=${LYCIUM_ARCHS:-arm64-v8a}
+    export LYCIUM_ROOT="$LYCIUM_TOOLS_DIR"
+    export LYCIUM_BUILD_CHECK=false
+    export MAKE="${MAKE:-make -j8}"
+    export OHOS_SDK="$SDK_DIR"
+    local ffmpeg_recipe_dir=$LYCIUM_ROOT_DIR/community/FFmpeg-surface-dev
+    if [ -d "$ffmpeg_recipe_dir" ]
     then
-        return 1
+        echo "Rebuild FFmpeg ($LYCIUM_ARCHS) with ohosavcodec poll fix"
+        ln -fs "$LYCIUM_TOOLS_DIR/script/build_hpk.sh" "$ffmpeg_recipe_dir/build_hpk.sh"
+        ln -fs "$LYCIUM_TOOLS_DIR/script/envset.sh" "$ffmpeg_recipe_dir/envset.sh"
+        local deps
+        deps=$(awk -F, '{print $1}' "$LYCIUM_TOOLS_DIR/usr/hpk_build.csv" 2>/dev/null | grep -v '^FFmpeg$' | sort -u | tr '\n' ' ')
+        (cd "$ffmpeg_recipe_dir" && bash ./build_hpk.sh $deps)
+        result=$?
+        if [ $result -ne 0 ]
+        then
+            cd "$ROOT_DIR" || true
+            return $result
+        fi
     fi
 
     bash build.sh vlc
     result=$?
-    cd $OLDPWD
+    cd "$ROOT_DIR" || true
     return $result
 }
 
@@ -142,11 +202,39 @@ function install_vlc_patches()
     cp -f "$ROOT_DIR/patches/0003-vcd-mode1-2048-iso.patch" "$vlc_recipe_dir/"
     cp -f "$ROOT_DIR/patches/0004-bluray-seek-fix.patch" "$vlc_recipe_dir/"
     cp -f "$ROOT_DIR/patches/0005-vcd-iso9660-no-cue.patch" "$vlc_recipe_dir/"
-    patch -d "$vlc_recipe_dir" -p0 < "$ROOT_DIR/patches/vlc-hpkbuild-apply-local-patches.patch"
-    if [ $? -ne 0 ]; then
+    cp -f "$ROOT_DIR/patches/0007-ohoscodec-attach-surface-context.patch" "$vlc_recipe_dir/"
+    if ! grep -q "0001-avcodec-respect-disabled-hardware-decoding.patch" "$vlc_recipe_dir/HPKBUILD"
+    then
+        patch -d "$vlc_recipe_dir" -p0 < "$ROOT_DIR/patches/vlc-hpkbuild-apply-local-patches.patch" || return 1
+    fi
+    if ! grep -q "enable-dvbpsi" "$vlc_recipe_dir/HPKBUILD"
+    then
+        patch -d "$vlc_recipe_dir" -p0 < "$ROOT_DIR/patches/vlc-hpkbuild-build-dvbpsi.patch" || return 1
+    fi
+    return 0
+}
+
+function install_ffmpeg_patches()
+{
+    local ffmpeg_recipe_dir=""
+    if [ -d "$LYCIUM_ROOT_DIR/community/FFmpeg-surface-dev" ]
+    then
+        ffmpeg_recipe_dir=$LYCIUM_ROOT_DIR/community/FFmpeg-surface-dev
+    elif [ -d "$LYCIUM_THIRDPARTY_DIR/FFmpeg-surface-dev" ]
+    then
+        ffmpeg_recipe_dir=$LYCIUM_THIRDPARTY_DIR/FFmpeg-surface-dev
+    else
+        echo "ERROR: FFmpeg-surface-dev recipe not found under $LYCIUM_ROOT_DIR"
         return 1
     fi
-    patch -d "$vlc_recipe_dir" -p0 < "$ROOT_DIR/patches/vlc-hpkbuild-build-dvbpsi.patch"
+
+    cp -f "$ROOT_DIR/patches/0006-ohosavcodec-avoid-zero-timeout-busy-poll.patch" "$ffmpeg_recipe_dir/"
+    if grep -q "0006-ohosavcodec-avoid-zero-timeout-busy-poll.patch" "$ffmpeg_recipe_dir/HPKBUILD"
+    then
+        echo "FFmpeg HPKBUILD already applies 0006, skip"
+        return 0
+    fi
+    patch -d "$ffmpeg_recipe_dir" -p0 < "$ROOT_DIR/patches/ffmpeg-hpkbuild-apply-hwdec-poll.patch"
     return $?
 }
 
@@ -201,6 +289,13 @@ function prebuild()
     if [ $? -ne 0 ]
     then
         echo "ERROR: install vlc patches failed!!!"
+        return 1
+    fi
+
+    install_ffmpeg_patches
+    if [ $? -ne 0 ]
+    then
+        echo "ERROR: install ffmpeg patches failed!!!"
         return 1
     fi
 

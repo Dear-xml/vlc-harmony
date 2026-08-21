@@ -1,0 +1,158 @@
+From: vlc-harmony maintainers
+Subject: [PATCH] ohosavcodec: avoid 0ms input-buffer busy poll
+
+The OHOS hardware decoder adapter used wait_for(0ms) while feeding packets.
+During decoder warmup that busy-polls OnNeedInputBuffer, logs
+"InputData failed, errcode=-5" tens of thousands of times per second, and
+stalls playback for the first few seconds. Wait on the input-buffer CV with
+a non-zero timeout, drain output when the queue is full, and do not log
+expected TIMEOUT/QUEUE_EMPTY as errors.
+
+diff --git a/libavcodec/ohosavcodecdec.c b/libavcodec/ohosavcodecdec.c
+index 78ef311288..fdfa9db5d6 100644
+--- a/libavcodec/ohosavcodecdec.c
++++ b/libavcodec/ohosavcodecdec.c
+@@ -118,7 +118,10 @@ static int ohosavcodec_receive_frame(struct AVCodecContext *avctx, struct AVFram
+     s->ctx->isSend = false;
+     while(1) {
+         if (s->buffered_pkt.size > 0) {
+-            ret = ff_ohosavcodec_dec_send(avctx, s->ctx, &s->buffered_pkt, false);
++            /* Block on the OHOS input-buffer CV. wait=false uses a 0 ms timeout and
++             * busy-polls while the decoder is still allocating buffers, flooding
++             * hilog with InputData failed/errcode=-5 and stalling the first seconds. */
++            ret = ff_ohosavcodec_dec_send(avctx, s->ctx, &s->buffered_pkt, true);
+             if (ret >= 0) {
+                 s->buffered_pkt.size -= ret;
+                 s->buffered_pkt.data += ret;
+@@ -133,6 +136,10 @@ static int ohosavcodec_receive_frame(struct AVCodecContext *avctx, struct AVFram
+                 return AVERROR_EXTERNAL;
+             }
+             if (s->buffered_pkt.size > 0) {
++                ret = ff_ohosavcodec_dec_receive(avctx, s->ctx, frame, false);
++                if (ret != AVERROR(EAGAIN)) {
++                    return ret;
++                }
+                 continue;
+             }
+         }
+diff --git a/libavcodec/ohoscodecdata.cpp b/libavcodec/ohoscodecdata.cpp
+index 6c172b5307..2bb522ebe9 100644
+--- a/libavcodec/ohoscodecdata.cpp
++++ b/libavcodec/ohoscodecdata.cpp
+@@ -46,16 +46,19 @@ int32_t CodecData::InputData(const uint8_t *data, size_t size, OH_AVCodecBufferA
+     }
+ 
+     std::unique_lock<std::mutex> lock(inputMutex_);
+-    bool waitForTimeout = !inputCond_.wait_for(lock, waitTime, [this](){
+-        return !this->inputBufferQueue_.empty();
+-    });
+-
+-    if (waitForTimeout) {
+-        OH_LOG_Print(LOG_APP, LOG_ERROR, LOG_DOMAIN, "DecoderData", "inputBufferQueue wait %{public}lld ms timeout!", waitTime.count());
+-        return ERRCODE_TIMEOUT;
++    bool ready = !inputBufferQueue_.empty();
++    if (!ready) {
++        if (waitTime.count() <= 0) {
++            return ERRCODE_TIMEOUT;
++        }
++        ready = inputCond_.wait_for(lock, waitTime, [this]() {
++            return !this->inputBufferQueue_.empty();
++        });
++        if (!ready) {
++            return ERRCODE_TIMEOUT;
++        }
+     }
+     if (inputBufferQueue_.empty()) {
+-        OH_LOG_Print(LOG_APP, LOG_WARN, LOG_DOMAIN, "DecoderData", "inputBufferInfoQueue is empty");
+         return ERRCODE_QUEUE_EMPTY;
+     }
+ 
+@@ -104,12 +107,10 @@ int32_t CodecData::OutputData(AvBufferInfo &buff, std::chrono::milliseconds wait
+     });
+ 
+     if (waitForTimeout && outputBufferQueue_.empty()) {
+-        OH_LOG_Print(LOG_APP, LOG_ERROR, LOG_DOMAIN, "DecoderData", "outputBufferQueue wait %{public}lld ms timeout!", waitTime.count());
+         return ERRCODE_TIMEOUT;
+     }
+ 
+     if (outputBufferQueue_.empty()) {
+-        OH_LOG_Print(LOG_APP, LOG_ERROR, LOG_DOMAIN, "DecoderData", "outputBufferQueue_ is empty");
+         return ERRCODE_QUEUE_EMPTY;
+     }
+ 
+@@ -127,12 +128,10 @@ int32_t CodecData::GetOutputBuffer(AvBufferInfo &buff, std::chrono::milliseconds
+     });
+ 
+     if (waitForTimeout && outputBufferQueue_.empty()) {
+-        OH_LOG_Print(LOG_APP, LOG_ERROR, LOG_DOMAIN, "DecoderData", "outputBufferQueue wait timeout!");
+         return ERRCODE_TIMEOUT;
+     }
+ 
+     if (outputBufferQueue_.empty()) {
+-        OH_LOG_Print(LOG_APP, LOG_ERROR, LOG_DOMAIN, "DecoderData", "outputBufferQueue_ is empty");
+         return ERRCODE_QUEUE_EMPTY;
+     }
+ 
+@@ -150,12 +149,10 @@ int32_t CodecData::GetInputBuffer(AvBufferInfo &buff, std::chrono::milliseconds
+     });
+ 
+     if (waitForTimeout && inputBufferQueue_.empty()) {
+-        OH_LOG_Print(LOG_APP, LOG_ERROR, LOG_DOMAIN, "DecoderData", "inputBufferQueue wait timeout!");
+         return ERRCODE_TIMEOUT;
+     }
+ 
+     if (inputBufferQueue_.empty()) {
+-        OH_LOG_Print(LOG_APP, LOG_ERROR, LOG_DOMAIN, "DecoderData", "inputBufferQueue is empty");
+         return ERRCODE_QUEUE_EMPTY;
+     }
+ 
+diff --git a/libavcodec/ohosvideodecoder.cpp b/libavcodec/ohosvideodecoder.cpp
+index a833ebe49d..216d2d0a94 100644
+--- a/libavcodec/ohosvideodecoder.cpp
++++ b/libavcodec/ohosvideodecoder.cpp
+@@ -163,8 +163,10 @@ int32_t VideoDecoder::PushInputData(uint8_t *pktData, size_t dataSize, int64_t p
+     int indx = -1;
+     int ret = codecData->InputData(pktData, dataSize, &attr, &indx, waitTimes);
+     if (ret != ERRCODE_OK) {
+-        OH_LOG_Print(LOG_APP, LOG_ERROR, LOG_DOMAIN, "VideoDecoder", "codec data set InputData failed,\
+-                     errcode=%{public}d", ret);
++        if (ret != ERRCODE_TIMEOUT && ret != ERRCODE_QUEUE_EMPTY) {
++            OH_LOG_Print(LOG_APP, LOG_ERROR, LOG_DOMAIN, "VideoDecoder", "codec data set InputData failed,\
++                         errcode=%{public}d", ret);
++        }
+         return ret;
+     }
+ 
+diff --git a/libavcodec/ohosvideodecoder_wrapper.cpp b/libavcodec/ohosvideodecoder_wrapper.cpp
+index 0042b39d81..6588718c6c 100644
+--- a/libavcodec/ohosvideodecoder_wrapper.cpp
++++ b/libavcodec/ohosvideodecoder_wrapper.cpp
+@@ -195,15 +195,15 @@ int ff_ohosavcodec_dec_send(AVCodecContext *avctx, OhosAvcodecDecContext *s,
+     OhosVideoCodecWrapper *codec = s->codec_wrapper;
+     int64_t pts = 0;
+     uint32_t frameType = 0; // OH_AVCodecBufferFlags
+-    int64_t timeoutUs = 0;
++    /* timeout is milliseconds (passed to chrono::milliseconds). Never use 0:
++     * wait_for(0ms) busy-polls OnNeedInputBuffer and logs ERRCODE_TIMEOUT. */
++    int64_t timeoutMs = INPUT_QUEUE_TIMEOUT_MS;
++    (void)wait;
+ 
+     if (pkt->size == 0) {
+         frameType = AVCODEC_BUFFER_FLAGS_EOS;
+     }
+ 
+-    if (wait) {
+-        timeoutUs = INPUT_QUEUE_TIMEOUT_MS;
+-    }
+     pts = pkt->pts;
+     if (pts == AV_NOPTS_VALUE) {
+         av_log(avctx, AV_LOG_WARNING, "Input packet is missing PTS");
+@@ -213,7 +213,7 @@ int ff_ohosavcodec_dec_send(AVCodecContext *avctx, OhosAvcodecDecContext *s,
+         pts = av_rescale_q(pts, avctx->pkt_timebase, AV_TIME_BASE_Q);
+     }
+ 
+-    int ret = ff_OhosAvcodec_PushInput(codec, pkt->data, pkt->size, 0, pts, frameType, timeoutUs);
++    int ret = ff_OhosAvcodec_PushInput(codec, pkt->data, pkt->size, 0, pts, frameType, timeoutMs);
+     if (ret >= 0) {
+         s->isSend = true;
+         if (pkt->size == 0) {

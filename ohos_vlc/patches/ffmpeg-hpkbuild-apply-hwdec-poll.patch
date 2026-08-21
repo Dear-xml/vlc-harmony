@@ -1,0 +1,16 @@
+--- HPKBUILD
++++ HPKBUILD
+@@ -39,6 +39,13 @@ prepare() {
+         git clone -b ohosdecoder_surface_dev https://gitee.com/openharmony-tpc-incubate/FFmpeg.git
+         cloneflag=false
+     fi
++    if [ -d "$builddir" ] && ! grep -q "Never use 0" "$builddir/libavcodec/ohosvideodecoder_wrapper.cpp" 2>/dev/null; then
++        patch -d "$builddir" -p1 < "$PWD/0006-ohosavcodec-avoid-zero-timeout-busy-poll.patch" >> $publicbuildlog 2>&1
++        if [ $? -ne 0 ]; then
++            echo "ERROR: apply 0006-ohosavcodec-avoid-zero-timeout-busy-poll.patch failed"
++            return -1
++        fi
++    fi
+     cp -rf $builddir/ $builddir-$ARCH-build/ 
+     if [ $ARCH == "armeabi-v7a" ]
+     then

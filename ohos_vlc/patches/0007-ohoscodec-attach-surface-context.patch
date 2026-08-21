@@ -1,0 +1,265 @@
+diff --git a/modules/codec/avcodec/video.c b/modules/codec/avcodec/video.c
+index 487c3cf..7043eec 100644
+--- a/modules/codec/avcodec/video.c
++++ b/modules/codec/avcodec/video.c
+@@ -49,6 +49,7 @@
+ #ifdef HAVE_OHOS
+     #include <libavcodec/ohosavcodec.h>
+     #include <libavutil/buffer.h>
++    #include <time.h>
+     #include "../../video_output/ohos/display.h"
+ #endif
+ 
+@@ -101,6 +102,14 @@ struct decoder_sys_t
+     int level;
+ 
+     vlc_sem_t sem_mt;
++
++#ifdef HAVE_OHOS
++    /* Surface presenter: next allowed CLOCK_MONOTONIC time. 0 = not started. */
++    int64_t ohos_next_ts;
++    int64_t ohos_frame_period_ns;
++    int      ohos_present_count;
++    int64_t  ohos_present_window_start;
++#endif
+ };
+ 
+ static inline void wait_mt(decoder_sys_t *sys)
+@@ -114,6 +123,14 @@ static inline void post_mt(decoder_sys_t *sys)
+ }
+ 
+ #ifdef HAVE_OHOS
++static int ohos_is_surface_frame(const AVCodecContext *ctx, const AVFrame *frame)
++{
++    /* createCodecByName overwrites pix_fmt to NV21 even in surface mode.
++     * Surface frames have no CPU planes; data[3] is OHOSAVCodecSurfaceCtx. */
++    return frame && frame->data[3] && frame->buf[0] && !frame->linesize[0] &&
++           (ctx->pix_fmt == AV_PIX_FMT_NV21 || ctx->pix_fmt == AV_PIX_FMT_OHOSCODEC);
++}
++
+ static void ohos_pic_ctx_destroy(picture_context_t *ctx)
+ {
+     ohos_picture_context_t *octx = (ohos_picture_context_t *)ctx;
+@@ -139,6 +156,62 @@ static picture_context_t *ohos_pic_ctx_copy(picture_context_t *ctx)
+         dst->buf_ref = (void *)av_buffer_ref((AVBufferRef *)src->buf_ref);
+     return &dst->s;
+ }
++
++/* Pace surface presents in the decoder thread.
++ * Stamping many frames into the future holds OHOS output buffers until the
++ * timestamp (RenderOutputBufferAtTime note 1), so the 4K HEVC pool starves
++ * and then bursts — which the composer drops (note 3). Sleep until the next
++ * slot, then present near "now" so only ~1 buffer is in flight. */
++static int64_t ohos_now_ns(void)
++{
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
++}
++
++static int64_t ohos_surface_timestamp_ns(decoder_t *p_dec, decoder_sys_t *p_sys)
++{
++    if (p_sys->ohos_frame_period_ns <= 0)
++    {
++        unsigned num = p_dec->fmt_in.video.i_frame_rate;
++        unsigned den = p_dec->fmt_in.video.i_frame_rate_base;
++        int64_t period = 16666666LL;
++        if (num > 0 && den > 0)
++            period = (int64_t)den * 1000000000LL / num;
++        /* 60000/1 etc. is a tick rate, not 60 fps. */
++        if (period < 8000000LL || period > 42000000LL)
++            period = 16666666LL;
++        p_sys->ohos_frame_period_ns = period;
++        msg_Err(p_dec, "OHOS surface pace %lld ns (rate %u/%u)",
++                (long long)period, num, den);
++    }
++
++    int64_t period = p_sys->ohos_frame_period_ns;
++    int64_t now = ohos_now_ns();
++
++    if (p_sys->ohos_next_ts > now)
++    {
++        int64_t delay = p_sys->ohos_next_ts - now;
++        if (delay > period)
++            delay = period;
++        struct timespec slp = { .tv_sec = 0, .tv_nsec = (long)delay };
++        nanosleep(&slp, NULL);
++        now = ohos_now_ns();
++    }
++
++    p_sys->ohos_next_ts = now + period;
++    p_sys->ohos_present_count++;
++    if (p_sys->ohos_present_window_start == 0)
++        p_sys->ohos_present_window_start = now;
++    else if (now - p_sys->ohos_present_window_start >= 1000000000LL)
++    {
++        msg_Err(p_dec, "OHOS present %d fps (target 60, period %lld ns)",
++                p_sys->ohos_present_count, (long long)period);
++        p_sys->ohos_present_count = 0;
++        p_sys->ohos_present_window_start = now;
++    }
++    return now;
++}
+ #endif
+ 
+ /*****************************************************************************
+@@ -630,6 +703,13 @@ static int InitVideoDecCommon( decoder_t *p_dec )
+     p_sys->i_late_frames = 0;
+     p_sys->b_from_preroll = false;
+     p_sys->b_draining = false;
++#ifdef HAVE_OHOS
++    p_sys->ohos_next_ts = 0;
++    p_sys->ohos_frame_period_ns = 0;
++    p_sys->ohos_present_count = 0;
++    p_sys->ohos_present_window_start = 0;
++    p_context->pkt_timebase = AV_TIME_BASE_Q;
++#endif
+ 
+     /* Set output properties */
+     if( GetVlcChroma( &p_dec->fmt_out.video, p_context->pix_fmt ) != VLC_SUCCESS )
+@@ -911,6 +991,9 @@ static void Flush( decoder_t *p_dec )
+     date_Set(&p_sys->pts, VLC_TICK_INVALID); /* To make sure we recover properly */
+     p_sys->i_late_frames = 0;
+     p_sys->b_draining = false;
++#ifdef HAVE_OHOS
++    p_sys->ohos_next_ts = 0;
++#endif
+     cc_Flush( &p_sys->cc );
+ 
+     /* Abort pictures in order to unblock all avcodec workers threads waiting
+@@ -937,6 +1020,9 @@ static bool check_block_validity( decoder_sys_t *p_sys, block_t *block )
+     {
+         date_Set( &p_sys->pts, VLC_TICK_INVALID ); /* To make sure we recover properly */
+         cc_Flush( &p_sys->cc );
++#ifdef HAVE_OHOS
++        p_sys->ohos_next_ts = 0;
++#endif
+ 
+         p_sys->i_late_frames = 0;
+         if( block->i_flags & BLOCK_FLAG_CORRUPTED )
+@@ -1390,10 +1476,14 @@ static picture_t *DecodeBlock( decoder_t *p_dec, block_t **pp_block, bool *error
+ 
+         update_late_frame_count( p_dec, p_block, current_time, i_pts, i_next_pts);
+ 
+-        if( !b_need_output_picture ||
++        if( ( !b_need_output_picture
++#ifdef HAVE_OHOS
++              && !ohos_is_surface_frame( p_context, frame )
++#endif
++            ) ||
+             ( !p_sys->p_va && !frame->linesize[0]
+ #ifdef HAVE_OHOS
+-            && p_context->pix_fmt != AV_PIX_FMT_NV21
++            && !ohos_is_surface_frame( p_context, frame )
+ #endif
+             ) ||
+            ( p_dec->b_frame_drop_allowed && (frame->flags & AV_FRAME_FLAG_CORRUPT) &&
+@@ -1403,6 +1493,20 @@ static picture_t *DecodeBlock( decoder_t *p_dec, block_t **pp_block, bool *error
+             continue;
+         }
+ 
++#ifdef HAVE_OHOS
++        /* pix_fmt is NV21 after codec create, but this is still a surface
++         * buffer. Pace RenderOutputBufferAtTime; do not dump ts=0. */
++        if( ohos_is_surface_frame( p_context, frame ) )
++        {
++            OHOSAVCodecSurfaceCtx *surface_ctx =
++                (OHOSAVCodecSurfaceCtx *)frame->data[3];
++            av_ohosavcodec_render_buffer_at_time(surface_ctx,
++                ohos_surface_timestamp_ns(p_dec, p_sys));
++            av_frame_free(&frame);
++            continue;
++        }
++#endif
++
+         if( p_context->pix_fmt == AV_PIX_FMT_PAL8
+          && !p_dec->fmt_out.video.p_palette )
+         {
+@@ -1449,32 +1553,48 @@ static picture_t *DecodeBlock( decoder_t *p_dec, block_t **pp_block, bool *error
+                 break;
+             }
+ 
+-            /* Fill picture_t from AVFrame */
+-            if( lavc_CopyPicture( p_dec, p_pic, frame ) != VLC_SUCCESS )
+-            {
+-                av_frame_free(&frame);
+-                picture_Release( p_pic );
+-                break;
+-            }
+ #ifdef HAVE_OHOS
+-            if( p_context->pix_fmt == AV_PIX_FMT_NV21)
++            /* Surface-mode frames have no CPU pixels. Keep the OHOS output
++             * buffer alive on the picture and let ohos_surface_display render
++             * it at vout time. Copying/freeing here FreeOutputBuffer's the
++             * buffer without Render, so decoded==N and displayed==0. */
++            if( p_context->pix_fmt == AV_PIX_FMT_OHOSCODEC )
+             {
+-                OHOSAVCodecSurfaceCtx *surface_ctx = (OHOSAVCodecSurfaceCtx *)frame->data[3];
+-                if( surface_ctx && frame->buf[0] )
++                OHOSAVCodecSurfaceCtx *surface_ctx =
++                    (OHOSAVCodecSurfaceCtx *)frame->data[3];
++                ohos_picture_context_t *octx;
++
++                if( !surface_ctx || !frame->buf[0] )
++                {
++                    av_frame_free(&frame);
++                    picture_Release( p_pic );
++                    break;
++                }
++                octx = malloc( sizeof(*octx) );
++                if( !octx )
+                 {
+-                    ohos_picture_context_t *octx = malloc( sizeof(*octx) );
+-                    if( octx )
+-                    {
+-                        av_ohosavcodec_render_buffer_at_time(surface_ctx, 0);
+-                    }
+-                    else
+-                    {
+-                        av_frame_free(&frame);
+-                        picture_Release( p_pic );
+-                        *error = true;
+-                        break;
+-                    }
++                    av_frame_free(&frame);
++                    picture_Release( p_pic );
++                    *error = true;
++                    break;
+                 }
++                octx->s.destroy = ohos_pic_ctx_destroy;
++                octx->s.copy = ohos_pic_ctx_copy;
++                octx->surface_ctx = surface_ctx;
++                octx->buf_ref = (void *)av_buffer_ref( frame->buf[0] );
++                octx->pf_render = (int (*)(void *, int64_t))av_ohosavcodec_render_buffer_at_time;
++                if( !octx->buf_ref )
++                {
++                    free( octx );
++                    av_frame_free(&frame);
++                    picture_Release( p_pic );
++                    *error = true;
++                    break;
++                }
++                p_pic->context = &octx->s;
++                p_pic->b_force = true;
++                av_ohosavcodec_render_buffer_at_time(surface_ctx,
++                    ohos_surface_timestamp_ns(p_dec, p_sys));
+             }
+             else
+ #endif
+@@ -1486,6 +1606,16 @@ static picture_t *DecodeBlock( decoder_t *p_dec, block_t **pp_block, bool *error
+                     picture_Release( p_pic );
+                     break;
+                 }
++#ifdef HAVE_OHOS
++                if( p_context->pix_fmt == AV_PIX_FMT_NV21 )
++                {
++                    OHOSAVCodecSurfaceCtx *surface_ctx =
++                        (OHOSAVCodecSurfaceCtx *)frame->data[3];
++                    if( surface_ctx && frame->buf[0] )
++                        av_ohosavcodec_render_buffer_at_time(surface_ctx,
++                            ohos_surface_timestamp_ns(p_dec, p_sys));
++                }
++#endif
+             }
+         }
+         else
